@@ -1,0 +1,11 @@
+.DS_STORE
+.DS_STORE?
+xcuserdata
+*.xcworkspace
+build
+Release
+ipch
+*.suo
+*.user
+*.sln
+*.sln.docstates
