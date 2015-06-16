@@ -1,31 +1,72 @@
 #include "parson/parson.h"
 
 #include <curl/curl.h>
+#include <map>
+#include <math.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <string>
 #include <string.h>
+#include <unistd.h>
 
 // define maximum number of planes
 #define MAX_PLANES 4096
 
-#define DATA_INDEX_LATITUDE 1
-#define DATA_INDEX_LONGITUDE 2
-#define DATA_INDEX_HEADING 3
-#define DATA_INDEX_ALTITUDE 4
-#define DATA_INDEX_SPEED 5
-#define DATA_INDEX_REGISTRATION 9
-#define DATA_INDEX_VERTICAL_SPEED 16
-#define DATA_INDEX_ICAO 17
+// define maximum viewing distance in nautical miles
+#define MAX_DISTANCE 20.0
 
-static int planeCount = 0;
-static struct Plane* planes[MAX_PLANES] = {NULL};
+// define intervall in seconds after which a plane is removed if there is no more data about it
+#define PLANE_TIMEOUT 30
 
-struct url_data
+// define URLs
+#define URL_BALANCE "http://www.flightradar24.com/balance.json"
+#define URL_ZONES "http://www.flightradar24.com/js/zones.js.php"
+#define URL_ZONE_INFIX "/zones/fcgi/"
+#define URL_ZONE_SUFFIX "_all.json"
+
+// define indices of relevant aircraft properties for parsing
+#define ARRAY_INDEX_LATITUDE 1
+#define ARRAY_INDEX_LONGITUDE 2
+#define ARRAY_INDEX_HEADING 3
+#define ARRAY_INDEX_ALTITUDE 4
+#define ARRAY_INDEX_SPEED 5
+#define ARRAY_INDEX_REGISTRATION 9
+#define ARRAY_INDEX_VERTICAL_SPEED 16
+#define ARRAY_INDEX_ICAO 17
+
+// define radius of the earth in nautical miles
+#define RADIUS_EARTH 3440.07
+
+// plane struct
+struct Plane
+{
+    char icao[8];
+    char registration[8];
+    double latitude; // degrees
+    double longitude; // degrees
+    double altitude; // feet AGL
+    float pitch; // degrees
+    float roll; // degrees
+    float heading; // degrees
+    int speed; // knots
+    int verticalSpeed; // feet per minute
+    time_t lastSeen; // seconds
+};
+
+//static double latitude = 0.0, longitude = 0.0;
+//static double latitude = 51.5286416 , longitude = -0.1015987; // London
+static double myLatitude = 48.3537449, myLongitude = 11.7860028; // Munich
+//static double myLatitude = 50.9987326, myLongitude = 13.9867738; // Desden
+//static double myLatitude = 37.7577, myLongitude = -122.4376; // San Francisco
+std::map<std::string, Plane*> planes;
+
+struct UrlData
 {
     size_t size;
     char* data;
 };
 
-static size_t WriteData(void *ptr, size_t size, size_t nmemb, url_data *data)
+static size_t WriteData(void *ptr, size_t size, size_t nmemb, UrlData *data)
 {
     size_t index = data->size;
     size_t n = (size * nmemb);
@@ -55,7 +96,7 @@ static char* GetUrl(const char* url)
 {
     CURL *curl = NULL;
     
-    url_data data;
+    UrlData data;
     data.size = 0;
     data.data = (char*) malloc(4096);
     if(NULL == data.data)
@@ -74,7 +115,7 @@ static char* GetUrl(const char* url)
         curl_easy_cleanup(curl);
         
     }
-printf("Data Size = %d\n", (int) data.size);
+
     return data.data;
 }
 
@@ -98,44 +139,41 @@ static char* GetBalancerUrl(void)
 {
     char *bestUrl = NULL;
 
-    char *balance = GetUrl("http://www.flightradar24.com/balance.json");
+    char *balance = GetUrl(URL_BALANCE);
     if (balance != NULL)
     {
         JSON_Value *rootJson = json_parse_string(balance);
         free(balance);
 
-        if (rootJson != NULL)
+        if (rootJson != NULL && rootJson->type == JSONObject)
         {
-            if (rootJson->type == JSONObject)
+            JSON_Object *serversJson = json_value_get_object(rootJson);
+
+            if (serversJson != NULL)
             {
-                JSON_Object *serversJson = json_value_get_object(rootJson);
+                size_t serverCount = json_object_get_count(serversJson);
+                int bestLoad = 0;
 
-                if (serversJson != NULL)
+                for (int i = 0; i < serverCount; i++)
                 {
-                    size_t serverCount = json_object_get_count(serversJson);
-                    int bestLoad = 0;
+                    const char *url = json_object_get_name(serversJson, i);
 
-                    for (int i = 0; i < serverCount; i++)
+                    JSON_Value *value = json_object_get_value(serversJson, url);
+
+                    if (value != NULL && value->type == JSONNumber)
                     {
-                        const char *url = json_object_get_name(serversJson, i);
+                        int load = (int) json_object_get_number(serversJson, url);
 
-                        JSON_Value *value = json_object_get_value(serversJson, url);
-
-                        if (value != NULL && value->type == JSONNumber)
+                        if (load != 0 && (bestUrl == NULL || load < bestLoad || (load == bestLoad && rand() % 2)))
                         {
-                            int load = (int) json_object_get_number(serversJson, url);
+                            if (bestUrl != NULL)
+                                free(bestUrl);
 
-                            if (load != 0 && (bestUrl == NULL || load < bestLoad))
-                            {
-                                if (bestUrl != NULL)
-                                    free(bestUrl);
+                            bestUrl = (char*) malloc(1 + strlen(url));
+                            if (bestUrl != NULL)
+                                strcpy(bestUrl, url);
 
-                                bestUrl = (char*) malloc(1 + strlen(url));
-                                if (bestUrl != NULL)
-                                    strcpy(bestUrl, url);
-
-                                bestLoad = load;
-                            }
+                            bestLoad = load;
                         }
                     }
                 }
@@ -150,132 +188,140 @@ static char* GetBalancerUrl(void)
 
 static char* ParseZones(JSON_Object *zonesJson, double latitude, double longitude)
 {
-printf("Subcall!\n");
     char *bestZone = NULL;
 
-                if (zonesJson != NULL)
+    if (zonesJson != NULL)
+    {
+        size_t zoneCount = json_object_get_count(zonesJson);
+
+        for (int i = 0; i < zoneCount; i++)
+        {
+            const char *z = json_object_get_name(zonesJson, i);
+            JSON_Value *valueJson = json_object_get_value(zonesJson, z);
+
+            if (valueJson != NULL && valueJson->type == JSONObject)
+            {
+                JSON_Object *zoneJson = json_value_get_object(valueJson);
+                double tl_x = 0.0, tl_y = 0.0, br_x = 0.0, br_y = 0.0;
+                JSON_Object *subzonesJson = NULL;
+
+                size_t propertyCount = json_object_get_count(zoneJson);
+                for (int j = 0; j < propertyCount; j++)
                 {
-                    size_t zoneCount = json_object_get_count(zonesJson);
-printf("zoneCount = %d\n", (int) zoneCount);
+                    const char *p = json_object_get_name(zoneJson, j);
+                    JSON_Value *propertyJson = json_object_get_value(zoneJson, p);
 
-                    for (int i = 0; i < zoneCount; i++)
+                    if (propertyJson != NULL)
                     {
-                        const char *z = json_object_get_name(zonesJson, i);
-printf("zone = %s\n", z);
-                        JSON_Value *valueJson = json_object_get_value(zonesJson, z);
-
-                        if (valueJson->type == JSONObject)
+                        if (propertyJson->type == JSONNumber)
                         {
-                            JSON_Object *zoneJson = json_value_get_object(valueJson);
-                            double tl_x = 0.0, tl_y = 0.0, br_x = 0.0, br_y = 0.0;
-                            JSON_Object *subzonesJson = NULL;
+                            double number = json_value_get_number(propertyJson);
 
-                            size_t propertyCount = json_object_get_count(zoneJson);
-                            for (int j = 0; j < propertyCount; j++)
-                            {
-                                const char *p = json_object_get_name(zoneJson, j);
-                                JSON_Value *propertyJson = json_object_get_value(zoneJson, p);
-
-                                if (propertyJson->type == JSONNumber)
-                                {
-                                    double number = json_value_get_number(propertyJson);
-
-                                    if (strcmp(p, "tl_x") == 0)
-                                        tl_x = number;
-                                    else if (strcmp(p, "tl_y") == 0)
-                                        tl_y = number;
-                                    else if (strcmp(p, "br_x") == 0)
-                                        br_x = number;
-                                    else if (strcmp(p, "br_y") == 0)
-                                        br_y = number;
-                                }
-                                else if (propertyJson->type == JSONObject)
-                                {
-                                    if (strcmp(p, "subzones") == 0)
-                                        subzonesJson = json_value_get_object(propertyJson);
-                                }
-                            }
-//printf(" tl_y = %f\n tl_x =%f\n br_y = %f\n br_x = %f\n", tl_y, tl_x, br_y, br_x);
-
-                            if (tl_x != 0.0 && tl_y != 0.0 && br_x != 0.0 && br_y != 0.0)
-                            {
-                                if (longitude >= tl_x && latitude <= tl_y && longitude <= br_x && latitude >= br_y)
-                                {
-                                    if (subzonesJson != NULL)
-                                        bestZone = ParseZones(subzonesJson, latitude, longitude);
-
-                                    if (bestZone == NULL)
-                                    {
-                                        bestZone = (char*) malloc(1 + strlen(z));
-                                        if (bestZone != NULL)
-                                            strcpy(bestZone, z);
-                                    }
-
-                                    break;
-                                }
-                            }
+                            if (strcmp(p, "tl_x") == 0)
+                                tl_x = number;
+                            else if (strcmp(p, "tl_y") == 0)
+                                tl_y = number;
+                            else if (strcmp(p, "br_x") == 0)
+                                br_x = number;
+                            else if (strcmp(p, "br_y") == 0)
+                                br_y = number;
                         }
+                        else if (propertyJson->type == JSONObject && (strcmp(p, "subzones") == 0))
+                                subzonesJson = json_value_get_object(propertyJson);
                     }
                 }
-return bestZone;
+
+                    if (tl_x != 0.0 && tl_y != 0.0 && br_x != 0.0 && br_y != 0.0 && longitude > tl_x + 2 && latitude < tl_y - 2 && longitude < br_x - 2 && latitude > br_y + 2)
+                    {
+                        if (subzonesJson != NULL)
+                            bestZone = ParseZones(subzonesJson, latitude, longitude);
+
+                        if (bestZone == NULL)
+                        {
+                            bestZone = (char*) malloc(1 + strlen(z));
+                            if (bestZone != NULL)
+                                strcpy(bestZone, z);
+                        }
+
+                        break;
+                    }
+                }
+            }
+        }
+
+    return bestZone;
 }
 
-static char* GetZone(double latitude, double longitude)
+static char* GetZoneName(double latitude, double longitude)
 {
     char *zoneName = NULL;
-    char *zones = GetUrl("http://www.flightradar24.com/js/zones.js.php");
+    char *zones = GetUrl(URL_ZONES);
 
     if (zones != NULL)
     {
         JSON_Value *rootJson = json_parse_string(zones);
         free(zones);
 
-        if (rootJson->type == JSONObject)
-            zoneName = ParseZones(json_value_get_object(rootJson), latitude, longitude);
+        if (rootJson != NULL)
+        {
+            if (rootJson->type == JSONObject)
+                zoneName = ParseZones(json_value_get_object(rootJson), latitude, longitude);
 
-        json_value_free(rootJson);
+            json_value_free(rootJson);
+        }
     }
 
     return zoneName;
 }
 
-// plane struct
-struct Plane
+// converts from degrees to radians
+inline static double DegreesToRadians(double degrees)
 {
-    char icao[8];
-    char registration[8];
-    double latitude; // degrees
-    double longitude; // degrees
-    double altitude; // feet MSL
-    float pitch; // degrees
-    float roll; // degrees
-    float heading; // degrees
-    int speed; // knots
-    int verticalSpeed; // feet per minute
-};
+    return degrees * (M_PI / 180.0);
+}
 
-void UpdateAircraft(char *balancerUrl, char *zone)
+// converts from degrees to radians
+inline static double RadiansToDegrees(double radians)
 {
-    #define URL_PART_MID "/zones/fcgi/"
-    #define URL_PART_END "_all.json"
+    return radians * (180.0 / M_PI);
+}
 
-    for (int i = 0; i < planeCount; i++)
+double Distance(double latitude1, double longitude1, double latitude2, double longitude2)
+{
+    double dLatitude = latitude2 - latitude1;
+    double dLongitude = longitude2 - longitude1;
+
+    double a = pow(sin(DegreesToRadians(dLatitude / 2.0)), 2) + cos(DegreesToRadians(latitude1)) * cos(DegreesToRadians(latitude2)) * pow(sin(DegreesToRadians(dLongitude / 2.0)), 2);
+    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+
+    return c * RADIUS_EARTH;
+}
+
+void UpdatePlanes(char *balancerUrl, char *zoneName)
+{
+    time_t currentTime = time(NULL);
+
+    if (currentTime != ((time_t) -1))
     {
-        if (planes[i] != NULL)
-            free(planes[i]);
+    for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
+    {
+        Plane *plane = p->second;
+        if (currentTime - plane->lastSeen > PLANE_TIMEOUT)
+        {
+            printf("Removing: %s - CurrentTime = %d - LastSeen = %d\n", p->first.c_str(), (int) currentTime, (int) plane->lastSeen);
+            free(plane);
+            planes.erase(p->first);
+        }
     }
-    planeCount = 0;
 
-    char url[strlen(balancerUrl) + strlen(URL_PART_MID) + strlen(zone) + strlen(URL_PART_END)];
-    sprintf(url, "%s%s%s%s", balancerUrl, URL_PART_MID, zone, URL_PART_END);
-    printf("Getting: %s\n", url);
+    char url[strlen(balancerUrl) + strlen(URL_ZONE_INFIX) + strlen(zoneName) + strlen(URL_ZONE_SUFFIX)];
+    sprintf(url, "%s%s%s%s", balancerUrl, URL_ZONE_INFIX, zoneName, URL_ZONE_SUFFIX);
 
-    char *data = GetUrl(url);
-//    printf("%s", data);
-    if (data != NULL)
+    char *zone = GetUrl(url);
+    if (zone != NULL)
     {
-        JSON_Value *rootJson = json_parse_string(data);
-        free(data);
+        JSON_Value *rootJson = json_parse_string(zone);
+        free(zone);
         if (rootJson != NULL)
         {
             if (rootJson->type == JSONObject)
@@ -284,89 +330,99 @@ void UpdateAircraft(char *balancerUrl, char *zone)
                 if (aircraftJson != NULL)
                 {
                     size_t aircraftCount = json_object_get_count(aircraftJson);
-printf("aircraftCount = %d\n", (int) aircraftCount);
                     for (int i = 0; i < aircraftCount; i++)
                     {
                         const char *id = json_object_get_name(aircraftJson, i);
+                        if (id != NULL)
+                        {
                         JSON_Value *value = json_object_get_value(aircraftJson, id);
 
                         if (value != NULL && value->type == JSONArray)
                         {
-                            JSON_Array *dataJson = json_value_get_array(value);
+                            JSON_Array *propertiesJson = json_value_get_array(value);
 
-                            if (dataJson != NULL)
-                            {           const char *icao = NULL, *registration = NULL;
-                                        int speed = 0, verticalSpeed = 0;
-                                        float heading = 0.0f;
-                                        double latitude = 0.0, longitude = 0.0, altitude = 0.0;
+                            if (propertiesJson != NULL)
+                            {
+                                const char *icao = NULL, *registration = NULL;
+                                int speed = 0, verticalSpeed = 0;
+                                float heading = 0.0f;
+                                double latitude = 0.0, longitude = 0.0, altitude = 0.0;
 
-
-                                int dataCount = json_array_get_count(dataJson);
-                                for (int k = 0; k < dataCount; k++)
+                                int propertyCount = json_array_get_count(propertiesJson);
+                                for (int k = 0; k < propertyCount; k++)
                                 {
-                                        JSON_Value *valueJson = json_array_get_value(dataJson, k);
-                                        if (valueJson != NULL)
-                                        {
+                                    JSON_Value *valueJson = json_array_get_value(propertiesJson, k);
+
+                                    if (valueJson != NULL)
+                                    {
                                         switch (k)
                                         {
-                                            case DATA_INDEX_LATITUDE:
+                                            case ARRAY_INDEX_LATITUDE:
                                                 latitude = json_value_get_number(valueJson);
                                                 break;
-                                            case DATA_INDEX_LONGITUDE:
+                                            case ARRAY_INDEX_LONGITUDE:
                                                 longitude = json_value_get_number(valueJson);
                                                 break;
-                                            case DATA_INDEX_ALTITUDE:
+                                            case ARRAY_INDEX_ALTITUDE:
                                                 altitude = json_value_get_number(valueJson);
                                                 break;
-                                            case DATA_INDEX_HEADING:
+                                            case ARRAY_INDEX_HEADING:
                                                 heading = (float) json_value_get_number(valueJson);
                                                 break;
-                                            case DATA_INDEX_SPEED:
+                                            case ARRAY_INDEX_SPEED:
                                                 speed = (int) json_value_get_number(valueJson);
                                                 break;
-                                            case DATA_INDEX_VERTICAL_SPEED:
+                                            case ARRAY_INDEX_VERTICAL_SPEED:
                                                 verticalSpeed = (int) json_value_get_number(valueJson);
                                                 break;
-                                            case DATA_INDEX_REGISTRATION:
+                                            case ARRAY_INDEX_REGISTRATION:
                                                 registration = json_value_get_string(valueJson);
                                                 break;
-                                            case DATA_INDEX_ICAO:
+                                            case ARRAY_INDEX_ICAO:
                                                 icao = json_value_get_string(valueJson);
                                                 break;
-					}
-                                        }
-                                 }
-
-                                        if (planeCount < MAX_PLANES && latitude != 0.0 && longitude != 0.0 && altitude != 0.0)
-                                        {
-                                            Plane *p = (Plane*) malloc(sizeof(*p));
-                                            if (p != NULL)
-                                            {
-                                            if (registration != NULL)
-                                                strncpy(p->registration, registration, 8);
-                                            else
-                                                strncpy(p->registration, "Unknown", 8);
-
-                                            if (icao != NULL)
-                                                strncpy(p->icao, icao, 8);
-                                            else
-                                                strncpy(p->icao, "Unknown", 8);
-                                            p->latitude = latitude;
-                                            p->longitude = longitude;
-                                            p->altitude = altitude;
-                                            p->pitch = 0.0f;
-                                            p->roll = 0.0f;
-                                            p->heading = heading;
-                                            p->speed = speed;
-                                            p->verticalSpeed = verticalSpeed;
-
-                                            planes[planeCount] = p;
-                                            planeCount++;
-                                            }
                                         }
                                     }
-                               
-                            
+                                }
+
+                                if (planes.size() < MAX_PLANES && latitude != 0.0 && longitude != 0.0 && Distance(myLatitude, myLongitude, latitude, longitude) <= MAX_DISTANCE)
+                                {
+                                    Plane *plane = NULL;
+
+                                    std::map<std::string, Plane*>::iterator p = planes.find(id);
+                                    if (p != planes.end())
+                                        plane = p->second;
+                                    else
+                                    {
+                                        plane = (Plane*) malloc(sizeof(*plane));
+                                        if (plane != NULL)
+                                           planes[std::string(id)] = plane;
+                                    }
+
+                                    if (plane != NULL)
+                                    {
+                                        if (registration != NULL && strlen(registration) > 0)
+                                            strncpy(plane->registration, registration, 8);
+                                        else
+                                            strncpy(plane->registration, "Unknown", 8);
+
+                                        if (icao != NULL && strlen(icao) > 0)
+                                            strncpy(plane->icao, icao, 8);
+                                        else
+                                            strncpy(plane->icao, "Unknown", 8);
+
+                                        plane->latitude = latitude;
+                                        plane->longitude = longitude;
+                                        plane->altitude = altitude;
+                                        plane->pitch = 0.0f;
+                                        plane->roll = 0.0f;
+                                        plane->heading = heading;
+                                        plane->speed = speed;
+                                        plane->verticalSpeed = verticalSpeed;
+                                        plane->lastSeen = currentTime;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -376,33 +432,53 @@ printf("aircraftCount = %d\n", (int) aircraftCount);
         }
     }
 }
+}
+}
+
+void *ThreadFunction(void *ptr)
+{
+    srand(time(NULL));
+
+while (true)
+{
+
+    char *balancerUrl = GetBalancerUrl();
+//printf("URL -> %s\n", balancerUrl);
+    if (balancerUrl != NULL)
+    {
+        char *zoneName = GetZoneName(myLatitude, myLongitude);
+        if (zoneName != NULL)
+        {
+//printf("ZONE -> %s\n", zoneName);
+            UpdatePlanes(balancerUrl, zoneName);
+            free(zoneName);
+        }
+
+        free(balancerUrl);
+    }
+
+    sleep(1);
+}
+}
 
 int main(void)
 {
-    char *balancerUrl = GetBalancerUrl();
-    printf("-> Selected Balancer URL = %s\n", balancerUrl);
+    pthread_t thread = 0;
+    pthread_create(&thread, NULL, ThreadFunction, NULL);
 
-    #define LON 51.5286416,-0.1015987
-    #define EDB 55.9410655,-3.2053836
-    #define MUC 48.1549107,11.5418357
-    #define SFO 37.7577,-122.4376
-    #define MLB -36.0491656,147.1498521
-    #define WSW 52.232938,21.0611941
-
-
-    char *zone = GetZone(MUC);
-    printf("-> Selected Zone = %s\n", zone);
+int frame = 0;
 while(true)
 {
-    UpdateAircraft(balancerUrl, zone);
-
-    for (int i = 0; i < planeCount; i++)
+    printf("\033[2J\033[1;1H");
+    printf("Frame = %d PlaneCount = %d\n\n", frame, (int) planes.size());
+    frame++;
+    for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
     {
-        Plane *p = planes[i];
-        printf("Plane %d:\n ICAO = %s\n Registration = %s\n Latitude = %f\n Longitude = %f\n Altitude = %f\n Speed = %d\n Vertical Speed = %d\n Heading = %f\n\n", i, p->icao, p->registration, p->latitude, p->longitude, p->altitude, p->speed, p->verticalSpeed, p->heading);
+        Plane *plane = p->second;
+            printf("Plane %s:\n ICAO = %s\n Registration = %s\n Latitude = %f\n Longitude = %f\n Altitude = %f\n Speed = %d\n Vertical Speed = %d\n Heading = %f\n\n", p->first.c_str(), plane->icao, plane->registration, plane->latitude, plane->longitude, plane->altitude, plane->speed, plane->verticalSpeed, plane->heading);
     }
+    sleep(1);
 }
 
-    free(balancerUrl);
-    free(zone);
+    return 0;
 }
