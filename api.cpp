@@ -9,9 +9,6 @@
 #include <string.h>
 #include <unistd.h>
 
-// define maximum number of planes
-#define MAX_PLANES 4096
-
 // define maximum viewing distance in nautical miles
 #define MAX_DISTANCE 20.0
 
@@ -42,10 +39,10 @@
 // plane struct
 struct Plane
 {
-    char registration[9]; // registration number
-    char icaoId[8]; // ICAO flight ID
-    char icaoType[4]; // ICAO aircraft type designator
-    char squawk[4]; // squawk code
+    char registration[10]; // registration number
+    char icaoId[9]; // ICAO flight ID
+    char icaoType[5]; // ICAO aircraft type designator
+    char squawk[5]; // squawk code
     double latitude; // degrees
     double longitude; // degrees
     double altitude; // feet MSL
@@ -70,21 +67,24 @@ static double myLatitude = 48.3537449, myLongitude = 11.7860028; // Munich
 //static double myLatitude = 47.4812134, myLongitude = 19.1303031; // Budapest
 std::map<std::string, Plane*> planes;
 
+pthread_mutex_t mutex;
+
+// define UrlData struct used by libcurl
 struct UrlData
 {
     size_t size;
     char* data;
 };
 
+// WriteData function used by libcurl
 static size_t WriteData(void *ptr, size_t size, size_t nmemb, UrlData *data)
 {
     size_t index = data->size;
     size_t n = (size * nmemb);
-    char* tmp;
 
     data->size += (size * nmemb);
 
-    tmp = (char*) realloc(data->data, data->size + 1); /* +1 for '\0' */
+    char *tmp = (char*) realloc(data->data, data->size + 1);
 
     if(tmp != NULL)
         data->data = tmp;
@@ -105,6 +105,7 @@ static size_t WriteData(void *ptr, size_t size, size_t nmemb, UrlData *data)
     return size * nmemb;
 }
 
+// retrieves a url with libcurl and returns the content
 static char* GetUrl(const char* url)
 {
     CURL *curl = NULL;
@@ -112,26 +113,26 @@ static char* GetUrl(const char* url)
     UrlData data;
     data.size = 0;
     data.data = (char*) malloc(4096);
-    if(NULL == data.data)
-        return NULL;
 
-    data.data[0] = '\0';
-
-    curl = curl_easy_init();
-    if (curl != NULL)
+    if(data.data != NULL)
     {
-        curl_easy_setopt(curl, CURLOPT_URL, url);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteData);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-        curl_easy_perform(curl);
+        data.data[0] = '\0';
 
-        curl_easy_cleanup(curl);
-
+        curl = curl_easy_init();
+        if (curl != NULL)
+        {
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteData);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
+            curl_easy_perform(curl);
+            curl_easy_cleanup(curl);
+        }
     }
 
     return data.data;
 }
 
+// define json_value_value type used by Parson
 typedef union json_value_value
 {
     char *string;
@@ -142,12 +143,14 @@ typedef union json_value_value
     int null;
 } JSON_Value_Value;
 
+// define json_value_t struct used by Parson
 struct json_value_t
 {
     JSON_Value_Type type;
     JSON_Value_Value value;
 };
 
+// retrieves the balancer url with the lowest load, if there are several balancers with the same load one of these is randomly selected
 static char* GetBalancerUrl(void)
 {
     char *bestUrl = NULL;
@@ -186,7 +189,7 @@ static char* GetBalancerUrl(void)
                                 bestUrl = NULL;
                             }
 
-                            bestUrl = (char*) malloc(1 + strlen(url));
+                            bestUrl = (char*) malloc(strlen(url) + 1);
                             if (bestUrl != NULL)
                                 strcpy(bestUrl, url);
 
@@ -216,28 +219,31 @@ inline static double RadiansToDegrees(double radians)
     return radians * (180.0 / M_PI);
 }
 
-void MidPoint(double *midLatitude, double *midLongitude, double latitude1, double longitude1, double latitude2, double longitude2)
+// calculates the midpoint between two given coordinates
+void GetMidpoint(double *latitudeMidpoint, double *longitudeMidpoint, double latiudeA, double longitudeA, double latiudeB, double longitudeB)
 {
-    double dLon = DegreesToRadians(longitude2 - longitude1);
-    double Bx = cos(DegreesToRadians(latitude2)) * cos(dLon);
-    double By = cos(DegreesToRadians(latitude2)) * sin(dLon);
+    double dLongitude = DegreesToRadians(longitudeB - longitudeA);
+    double bX = cos(DegreesToRadians(latiudeB)) * cos(dLongitude);
+    double bY = cos(DegreesToRadians(latiudeB)) * sin(dLongitude);
 
-    *midLatitude = RadiansToDegrees(atan2(sin(DegreesToRadians(latitude1)) + sin(DegreesToRadians(latitude2)), sqrt((cos(DegreesToRadians(latitude1)) + Bx) * (cos(DegreesToRadians(latitude1)) + Bx) + By * By)));
+    *latitudeMidpoint = RadiansToDegrees(atan2(sin(DegreesToRadians(latiudeA)) + sin(DegreesToRadians(latiudeB)), sqrt((cos(DegreesToRadians(latiudeA)) + bX) * (cos(DegreesToRadians(latiudeA)) + bX) + bY * bY)));
 
-    *midLongitude = longitude1 + RadiansToDegrees(atan2(By, cos(DegreesToRadians(latitude1)) + Bx));
+    *longitudeMidpoint = longitudeA + RadiansToDegrees(atan2(bY, cos(DegreesToRadians(latiudeA)) + bX));
 }
 
-double Distance(double latitude1, double longitude1, double latitude2, double longitude2)
+// calculates the distance between two coordinates in nautical miles
+double GetDistance(double latiudeA, double longitudeA, double latiudeB, double longitudeB)
 {
-    double dLatitude = latitude2 - latitude1;
-    double dLongitude = longitude2 - longitude1;
+    double dLatitude = latiudeB - latiudeA;
+    double dLongitude = longitudeB - longitudeA;
 
-    double a = pow(sin(DegreesToRadians(dLatitude / 2.0)), 2) + cos(DegreesToRadians(latitude1)) * cos(DegreesToRadians(latitude2)) * pow(sin(DegreesToRadians(dLongitude / 2.0)), 2);
+    double a = pow(sin(DegreesToRadians(dLatitude / 2.0)), 2) + cos(DegreesToRadians(latiudeA)) * cos(DegreesToRadians(latiudeB)) * pow(sin(DegreesToRadians(dLongitude / 2.0)), 2);
     double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
 
     return c * RADIUS_EARTH;
 }
 
+// parses a JSON object containing zones and calculates the zone that fits the given latitude and longitude best, bestDistance is used internally and contains the distance from the midpoint of the selected zone
 static void ParseZones(char **bestZone, double *bestDistance, JSON_Object *zonesJson, double latitude, double longitude)
 {
     *bestDistance = -1.0;
@@ -248,20 +254,20 @@ static void ParseZones(char **bestZone, double *bestDistance, JSON_Object *zones
 
         for (int i = 0; i < zoneCount; i++)
         {
-            const char *z = json_object_get_name(zonesJson, i);
-            JSON_Value *valueJson = json_object_get_value(zonesJson, z);
+            const char *zoneName = json_object_get_name(zonesJson, i);
+            JSON_Value *valueJson = json_object_get_value(zonesJson, zoneName);
 
             if (valueJson != NULL && valueJson->type == JSONObject)
             {
                 JSON_Object *zoneJson = json_value_get_object(valueJson);
-                double tl_x = 0.0, tl_y = 0.0, br_x = 0.0, br_y = 0.0;
+                double topLeftX = 0.0, topLeftY = 0.0, bottomRightX = 0.0, bottomRightY = 0.0;
                 JSON_Object *subzonesJson = NULL;
 
                 size_t propertyCount = json_object_get_count(zoneJson);
                 for (int j = 0; j < propertyCount; j++)
                 {
-                    const char *p = json_object_get_name(zoneJson, j);
-                    JSON_Value *propertyJson = json_object_get_value(zoneJson, p);
+                    const char *propertyName = json_object_get_name(zoneJson, j);
+                    JSON_Value *propertyJson = json_object_get_value(zoneJson, propertyName);
 
                     if (propertyJson != NULL)
                     {
@@ -269,26 +275,26 @@ static void ParseZones(char **bestZone, double *bestDistance, JSON_Object *zones
                         {
                             double number = json_value_get_number(propertyJson);
 
-                            if (strcmp(p, "tl_x") == 0)
-                                tl_x = number;
-                            else if (strcmp(p, "tl_y") == 0)
-                                tl_y = number;
-                            else if (strcmp(p, "br_x") == 0)
-                                br_x = number;
-                            else if (strcmp(p, "br_y") == 0)
-                                br_y = number;
+                            if (strcmp(propertyName, "tl_x") == 0)
+                                topLeftX = number;
+                            else if (strcmp(propertyName, "tl_y") == 0)
+                                topLeftY = number;
+                            else if (strcmp(propertyName, "br_x") == 0)
+                                bottomRightX = number;
+                            else if (strcmp(propertyName, "br_y") == 0)
+                                bottomRightY = number;
                         }
-                        else if (propertyJson->type == JSONObject && (strcmp(p, "subzones") == 0))
+                        else if (propertyJson->type == JSONObject && (strcmp(propertyName, "subzones") == 0))
                             subzonesJson = json_value_get_object(propertyJson);
                     }
                 }
 
-                if (tl_x != 0.0 && tl_y != 0.0 && br_x != 0.0 && br_y != 0.0 && longitude > tl_x && latitude < tl_y && longitude < br_x && latitude > br_y)
+                if (topLeftX != 0.0 && topLeftY != 0.0 && bottomRightX != 0.0 && bottomRightY != 0.0 && longitude > topLeftX && latitude < topLeftY && longitude < bottomRightX && latitude > bottomRightY)
                 {
-                    double midLatitude = 0.0, midLongitude = 0.0;
-                    MidPoint(&midLatitude, &midLongitude, tl_y, tl_x, br_y, br_x);
-                    double distance = Distance(midLatitude, midLongitude, latitude, longitude);
-                    printf("Distance from %s = %f\n", z, distance);
+                    double latitudeMidpoint = 0.0, longitudeMidpoint = 0.0;
+                    GetMidpoint(&latitudeMidpoint, &longitudeMidpoint, topLeftY, topLeftX, bottomRightY, bottomRightX);
+                    double distance = GetDistance(latitudeMidpoint, longitudeMidpoint, latitude, longitude);
+//                    printf("Distance from %s = %f\n", zoneName, distance);
                     if (*bestDistance == -1.0 || distance < *bestDistance)
                     {
                         if (*bestZone != NULL)
@@ -313,9 +319,9 @@ static void ParseZones(char **bestZone, double *bestDistance, JSON_Object *zones
                         if (*bestZone == NULL)
                         {
                             *bestDistance = distance;
-                            *bestZone = (char*) malloc(1 + strlen(z));
+                            *bestZone = (char*) malloc(strlen(zoneName) + 1);
                             if (*bestZone != NULL)
-                                strcpy(*bestZone, z);
+                                strcpy(*bestZone, zoneName);
                         }
                     }
                 }
@@ -324,6 +330,7 @@ static void ParseZones(char **bestZone, double *bestDistance, JSON_Object *zones
     }
 }
 
+// returns the name of the zone that fits the given latitude and longitude best
 static char* GetZoneName(double latitude, double longitude)
 {
     char *zoneName = NULL;
@@ -351,23 +358,27 @@ static char* GetZoneName(double latitude, double longitude)
     return zoneName;
 }
 
-void UpdatePlanes(char *balancerUrl, char *zoneName)
+// updates the planes map, planes not seen for a defined intervall are removed from the map and only planes within a defined distance from the given latitude and longited
+void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double longitude)
 {
     time_t currentTime = time(NULL);
 
     if (currentTime != ((time_t) -1))
     {
+
+        pthread_mutex_lock(&mutex);
         for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
         {
             Plane *plane = p->second;
             if (currentTime - plane->lastSeen > PLANE_TIMEOUT)
             {
-                printf("Removing: %s - CurrentTime = %d - LastSeen = %d\n", p->first.c_str(), (int) currentTime, (int) plane->lastSeen);
+                //printf("Removing: %s - CurrentTime = %d - LastSeen = %d\n", p->first.c_str(), (int) currentTime, (int) plane->lastSeen);
                 free(plane);
                 plane = NULL;
                 planes.erase(p->first);
             }
         }
+        pthread_mutex_unlock(&mutex);
 
         char url[strlen(balancerUrl) + strlen(URL_ZONE_INFIX) + strlen(zoneName) + strlen(URL_ZONE_SUFFIX)];
         sprintf(url, "%s%s%s%s", balancerUrl, URL_ZONE_INFIX, zoneName, URL_ZONE_SUFFIX);
@@ -401,7 +412,7 @@ void UpdatePlanes(char *balancerUrl, char *zoneName)
                                     if (propertiesJson != NULL)
                                     {
                                         const char *registration = NULL, *icaoId = NULL, *icaoType = NULL, *squawk = NULL;
-                                        double latitude = 0.0, longitude = 0.0, altitude = 0.0;
+                                        double latitudePlane = 0.0, longitudePlane = 0.0, altitude = 0.0;
                                         float heading = 0.0f;
                                         int speed = 0, verticalSpeed = 0;
 
@@ -415,10 +426,10 @@ void UpdatePlanes(char *balancerUrl, char *zoneName)
                                                 switch (k)
                                                 {
                                                 case ARRAY_INDEX_LATITUDE:
-                                                    latitude = json_value_get_number(valueJson);
+                                                    latitudePlane = json_value_get_number(valueJson);
                                                     break;
                                                 case ARRAY_INDEX_LONGITUDE:
-                                                    longitude = json_value_get_number(valueJson);
+                                                    longitudePlane = json_value_get_number(valueJson);
                                                     break;
                                                 case ARRAY_INDEX_ALTITUDE:
                                                     altitude = json_value_get_number(valueJson);
@@ -448,10 +459,11 @@ void UpdatePlanes(char *balancerUrl, char *zoneName)
                                             }
                                         }
 
-                                        if (planes.size() < MAX_PLANES && latitude != 0.0 && longitude != 0.0 && Distance(myLatitude, myLongitude, latitude, longitude) <= MAX_DISTANCE)
+                                        if (latitudePlane != 0.0 && longitudePlane != 0.0 && GetDistance(latitude, longitude, latitudePlane, longitudePlane) <= MAX_DISTANCE)
                                         {
                                             Plane *plane = NULL;
 
+                                            pthread_mutex_lock(&mutex);
                                             std::map<std::string, Plane*>::iterator p = planes.find(id);
                                             if (p != planes.end())
                                                 plane = p->second;
@@ -476,8 +488,8 @@ void UpdatePlanes(char *balancerUrl, char *zoneName)
                                                 strncpy(plane->icaoId, icaoId, sizeof(plane->icaoId) / sizeof(char));
                                                 strncpy(plane->icaoType, icaoType, sizeof(plane->icaoType) / sizeof(char));
                                                 strncpy(plane->squawk, squawk, sizeof(plane->squawk) / sizeof(char));
-                                                plane->latitude = latitude;
-                                                plane->longitude = longitude;
+                                                plane->latitude = latitudePlane;
+                                                plane->longitude = longitudePlane;
                                                 plane->altitude = altitude;
                                                 plane->pitch = 0.0f;
                                                 plane->roll = 0.0f;
@@ -486,6 +498,7 @@ void UpdatePlanes(char *balancerUrl, char *zoneName)
                                                 plane->verticalSpeed = verticalSpeed;
                                                 plane->lastSeen = currentTime;
                                             }
+                                            pthread_mutex_unlock(&mutex);
                                         }
                                     }
                                 }
@@ -501,22 +514,23 @@ void UpdatePlanes(char *balancerUrl, char *zoneName)
     }
 }
 
-void *ThreadFunction(void *ptr)
+void *UpdateThreadFunction(void *ptr)
 {
     srand(time(NULL));
 
     while (true)
     {
+        double latitude = myLatitude, longitude = myLongitude;
 
         char *balancerUrl = GetBalancerUrl();
-        printf("URL -> %s\n", balancerUrl);
+//        printf("URL -> %s\n", balancerUrl);
         if (balancerUrl != NULL)
         {
-            char *zoneName = GetZoneName(myLatitude, myLongitude);
+            char *zoneName = GetZoneName(latitude, longitude);
             if (zoneName != NULL)
             {
-                printf("ZONE -> %s\n", zoneName);
-                UpdatePlanes(balancerUrl, zoneName);
+//                printf("ZONE -> %s\n", zoneName);
+                UpdatePlanes(balancerUrl, zoneName, latitude, longitude);
                 free(zoneName);
                 zoneName = NULL;
             }
@@ -532,21 +546,25 @@ void *ThreadFunction(void *ptr)
 int main(void)
 {
     pthread_t thread = 0;
-    pthread_create(&thread, NULL, ThreadFunction, NULL);
+    pthread_mutex_init(&mutex, 0);
+    pthread_create(&thread, NULL, UpdateThreadFunction, NULL);
 
-    int frame = 0;
     while(true)
     {
         printf("\033[2J\033[1;1H");
-        printf("Frame = %d PlaneCount = %d\n\n", frame, (int) planes.size());
-        frame++;
+        printf("PlaneCount = %d\n\n", (int) planes.size());
+
+        pthread_mutex_lock(&mutex);
         for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
         {
             Plane *plane = p->second;
             printf("Plane %s:\n Registration = %s\n ICAO ID = %s\n ICAO Type = %s\n Squawk = %s\n Latitude = %f\n Longitude = %f\n Altitude = %f\n Heading = %f\n Speed = %d\n Vertical Speed = %d\n\n", p->first.c_str(), plane->registration, plane->icaoId, plane->icaoType, plane->squawk, plane->latitude, plane->longitude, plane->altitude, plane->heading, plane->speed, plane->verticalSpeed);
         }
+        pthread_mutex_unlock(&mutex);
+
         sleep(1);
     }
 
+    pthread_mutex_destroy(&mutex);
     return 0;
 }
