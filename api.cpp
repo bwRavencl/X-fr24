@@ -1,11 +1,10 @@
+#include "api.h"
 #include "parson/parson.h"
 
 #include <curl/curl.h>
-#include <map>
 #include <math.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <string>
 #include <string.h>
 #include <unistd.h>
 
@@ -36,38 +35,24 @@
 // define radius of the earth in nautical miles
 #define RADIUS_EARTH 3440.07
 
-// plane struct
-struct Plane
-{
-    char registration[10]; // registration number
-    char icaoId[9]; // ICAO flight ID
-    char icaoType[5]; // ICAO aircraft type designator
-    char squawk[5]; // squawk code
-    double latitude; // degrees
-    double longitude; // degrees
-    double altitude; // feet MSL
-    float pitch; // degrees
-    float roll; // degrees
-    float heading; // degrees
-    int speed; // knots
-    int verticalSpeed; // feet per minute
-    time_t lastSeen; // seconds
-};
-
-//static double latitude = 0.0, longitude = 0.0;
-//static double myLatitude = 51.5286416 , myLongitude = -0.1015987; // London
-//static double myLatitude = 50.4433421, myLongitude = -4.9443987; // Cornwall
-static double myLatitude = 48.3537449, myLongitude = 11.7860028; // Munich
-//static double myLatitude = 50.9987326, myLongitude = 13.9867738; // Dresden
-//static double myLatitude = 37.7577, myLongitude = -122.4376; // San Francisco
-//static double myLatitude = 40.7033127, myLongitude = -73.979681; // New York
-//static double myLatitude = 34.0204989, myLongitude = -118.4117325; // Los Angeles
-//static double myLatitude = 49.8152995, myLongitude = 6.13332; // Luxemburg
-//static double myLatitude = -33.7969235, myLongitude = 150.9224326; //Sydney
-//static double myLatitude = 47.4812134, myLongitude = 19.1303031; // Budapest
+// external variables
 std::map<std::string, Plane*> planes;
+pthread_mutex_t planesMutex;
 
-pthread_mutex_t mutex;
+// global variables
+static double userLatitude = 48.3537449, userLongitude = 11.7860028; // Munich
+//static double latitude = 0.0, longitude = 0.0;
+//static double userLatitude = 51.5286416 , userLongitude = -0.1015987; // London
+//static double userLatitude = 50.4433421, userLongitude = -4.9443987; // Cornwall
+//static double userLatitude = 50.9987326, userLongitude = 13.9867738; // Dresden
+//static double userLatitude = 37.7577, userLongitude = -122.4376; // San Francisco
+//static double userLatitude = 40.7033127, userLongitude = -73.979681; // New York
+//static double userLatitude = 34.0204989, userLongitude = -118.4117325; // Los Angeles
+//static double userLatitude = 49.8152995, userLongitude = 6.13332; // Luxemburg
+//static double userLatitude = -33.7969235, userLongitude = 150.9224326; //Sydney
+//static double userLatitude = 47.4812134, userLongitude = 19.1303031; // Budapest
+static pthread_t thread = 0;
+static pthread_mutex_t positionMutex;
 
 // define UrlData struct used by libcurl
 struct UrlData
@@ -106,7 +91,7 @@ static size_t WriteData(void *ptr, size_t size, size_t nmemb, UrlData *data)
 }
 
 // retrieves a url with libcurl and returns the content
-static char* GetUrl(const char* url)
+static char *GetUrl(const char *url)
 {
     CURL *curl = NULL;
 
@@ -151,7 +136,7 @@ struct json_value_t
 };
 
 // retrieves the balancer url with the lowest load, if there are several balancers with the same load one of these is randomly selected
-static char* GetBalancerUrl(void)
+static char *GetBalancerUrl(void)
 {
     char *bestUrl = NULL;
 
@@ -220,7 +205,7 @@ inline static double RadiansToDegrees(double radians)
 }
 
 // calculates the midpoint between two given coordinates
-void GetMidpoint(double *latitudeMidpoint, double *longitudeMidpoint, double latiudeA, double longitudeA, double latiudeB, double longitudeB)
+static void GetMidpoint(double *latitudeMidpoint, double *longitudeMidpoint, double latiudeA, double longitudeA, double latiudeB, double longitudeB)
 {
     double dLongitude = DegreesToRadians(longitudeB - longitudeA);
     double bX = cos(DegreesToRadians(latiudeB)) * cos(dLongitude);
@@ -232,7 +217,7 @@ void GetMidpoint(double *latitudeMidpoint, double *longitudeMidpoint, double lat
 }
 
 // calculates the distance between two coordinates in nautical miles
-double GetDistance(double latiudeA, double longitudeA, double latiudeB, double longitudeB)
+static double GetDistance(double latiudeA, double longitudeA, double latiudeB, double longitudeB)
 {
     double dLatitude = latiudeB - latiudeA;
     double dLongitude = longitudeB - longitudeA;
@@ -331,7 +316,7 @@ static void ParseZones(char **bestZone, double *bestDistance, JSON_Object *zones
 }
 
 // returns the name of the zone that fits the given latitude and longitude best
-static char* GetZoneName(double latitude, double longitude)
+static char *GetZoneName(double latitude, double longitude)
 {
     char *zoneName = NULL;
     char *zones = GetUrl(URL_ZONES);
@@ -359,14 +344,14 @@ static char* GetZoneName(double latitude, double longitude)
 }
 
 // updates the planes map, planes not seen for a defined intervall are removed from the map and only planes within a defined distance from the given latitude and longited
-void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double longitude)
+static void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double longitude)
 {
     time_t currentTime = time(NULL);
 
     if (currentTime != ((time_t) -1))
     {
 
-        pthread_mutex_lock(&mutex);
+        pthread_mutex_lock(&planesMutex);
         for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
         {
             Plane *plane = p->second;
@@ -378,7 +363,7 @@ void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double lon
                 planes.erase(p->first);
             }
         }
-        pthread_mutex_unlock(&mutex);
+        pthread_mutex_unlock(&planesMutex);
 
         char url[strlen(balancerUrl) + strlen(URL_ZONE_INFIX) + strlen(zoneName) + strlen(URL_ZONE_SUFFIX)];
         sprintf(url, "%s%s%s%s", balancerUrl, URL_ZONE_INFIX, zoneName, URL_ZONE_SUFFIX);
@@ -463,7 +448,7 @@ void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double lon
                                         {
                                             Plane *plane = NULL;
 
-                                            pthread_mutex_lock(&mutex);
+                                            pthread_mutex_lock(&planesMutex);
                                             std::map<std::string, Plane*>::iterator p = planes.find(id);
                                             if (p != planes.end())
                                                 plane = p->second;
@@ -498,7 +483,7 @@ void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double lon
                                                 plane->verticalSpeed = verticalSpeed;
                                                 plane->lastSeen = currentTime;
                                             }
-                                            pthread_mutex_unlock(&mutex);
+                                            pthread_mutex_unlock(&planesMutex);
                                         }
                                     }
                                 }
@@ -514,13 +499,16 @@ void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, double lon
     }
 }
 
-void *UpdateThreadFunction(void *ptr)
+// thread function that handels the update process
+static void *UpdateThreadFunction(void *ptr)
 {
     srand(time(NULL));
 
     while (true)
     {
-        double latitude = myLatitude, longitude = myLongitude;
+    pthread_mutex_lock(&positionMutex);
+    double latitude = userLatitude, longitude = userLongitude;
+    pthread_mutex_unlock(&positionMutex);
 
         char *balancerUrl = GetBalancerUrl();
 //        printf("URL -> %s\n", balancerUrl);
@@ -543,28 +531,52 @@ void *UpdateThreadFunction(void *ptr)
     }
 }
 
+// provides safe writing access to the users position
+void SetPosition(double latitude, double longitude)
+{
+    pthread_mutex_lock(&positionMutex);
+    userLatitude = latitude;
+    userLongitude = longitude;
+    pthread_mutex_unlock(&positionMutex);
+}
+
+// initilializes the update thread and the mutexes
+void Init(void)
+{
+    pthread_mutex_init(&planesMutex, 0);
+    pthread_mutex_init(&positionMutex, 0);
+    pthread_create(&thread, NULL, UpdateThreadFunction, NULL);
+}
+
+// destroys the mutexes
+void Cleanup(void)
+{
+    pthread_cancel(thread);
+    pthread_mutex_destroy(&planesMutex);
+    pthread_mutex_destroy(&positionMutex);
+}
+
 int main(void)
 {
-    pthread_t thread = 0;
-    pthread_mutex_init(&mutex, 0);
-    pthread_create(&thread, NULL, UpdateThreadFunction, NULL);
+    Init();
 
     while(true)
     {
         printf("\033[2J\033[1;1H");
         printf("PlaneCount = %d\n\n", (int) planes.size());
 
-        pthread_mutex_lock(&mutex);
+        pthread_mutex_lock(&planesMutex);
         for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
         {
             Plane *plane = p->second;
             printf("Plane %s:\n Registration = %s\n ICAO ID = %s\n ICAO Type = %s\n Squawk = %s\n Latitude = %f\n Longitude = %f\n Altitude = %f\n Heading = %f\n Speed = %d\n Vertical Speed = %d\n\n", p->first.c_str(), plane->registration, plane->icaoId, plane->icaoType, plane->squawk, plane->latitude, plane->longitude, plane->altitude, plane->heading, plane->speed, plane->verticalSpeed);
         }
-        pthread_mutex_unlock(&mutex);
+        pthread_mutex_unlock(&planesMutex);
 
         sleep(1);
     }
 
-    pthread_mutex_destroy(&mutex);
+    Cleanup();
+
     return 0;
 }
