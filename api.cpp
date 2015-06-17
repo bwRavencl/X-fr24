@@ -556,7 +556,7 @@ void Cleanup(void)
     pthread_mutex_destroy(&positionMutex);
 }
 
-int main(void)
+/*int main(void)
 {
     Init();
 
@@ -579,4 +579,4 @@ int main(void)
     Cleanup();
 
     return 0;
-}
+}*/

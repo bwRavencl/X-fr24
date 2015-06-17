@@ -3,7 +3,7 @@ SRC_BASE    := .
 TARGET      := x_fr24
 
 SOURCES = \
-        x_fr24.cpp
+        parson/parson.c api.cpp x_fr24.cpp
 
 LIBS = -lcurl
  
