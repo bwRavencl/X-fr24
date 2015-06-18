@@ -21,8 +21,12 @@ struct Plane
     int speed; // knots
     int verticalSpeed; // feet per minute
     time_t lastSeen; // seconds
+    double interpolatedLatitude; // degrees
+    double interpolatedLongitude; // degrees
+    double interpolatedAltitude; // degrees
 };
 
+// external variables
 extern std::map<std::string, Plane*> planes;
 extern pthread_mutex_t planesMutex;
 
@@ -32,7 +36,7 @@ void SetPosition(double latitude, double longitude);
 // initilializes the update thread and the mutexes
 void Init(void);
 
-// destroys the mutexes
+// uninitializes the reserved memory, thread and mutexes
 void Cleanup(void);
 
 #endif

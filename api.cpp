@@ -29,8 +29,8 @@
 #define ARRAY_INDEX_SQUAWK 6
 #define ARRAY_INDEX_ICAO_TYPE 8
 #define ARRAY_INDEX_REGISTRATION 9
-#define ARRAY_INDEX_VERTICAL_SPEED 16
-#define ARRAY_INDEX_ICAO_ID 17
+#define ARRAY_INDEX_VERTICAL_SPEED 15
+#define ARRAY_INDEX_ICAO_ID 16
 
 // define radius of the earth in nautical miles
 #define RADIUS_EARTH 3440.07
@@ -40,6 +40,7 @@ std::map<std::string, Plane*> planes;
 pthread_mutex_t planesMutex;
 
 // global variables
+static char *lastZone = NULL;
 static double userLatitude = 48.3537449, userLongitude = 11.7860028; // Munich
 //static double latitude = 0.0, longitude = 0.0;
 //static double userLatitude = 51.5286416 , userLongitude = -0.1015987; // London
@@ -166,7 +167,7 @@ static char *GetBalancerUrl(void)
                     {
                         int load = (int) json_object_get_number(serversJson, url);
 
-                        if (load != 0 && (bestUrl == NULL || load < bestLoad || (load == bestLoad && rand() % 2)))
+                        if (load != 0 && (bestUrl == NULL || load <= bestLoad/* || (load == bestLoad && rand() % 2)*/))
                         {
                             if (bestUrl != NULL)
                             {
@@ -350,7 +351,6 @@ static void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, dou
 
     if (currentTime != ((time_t) -1))
     {
-
         pthread_mutex_lock(&planesMutex);
         for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
         {
@@ -371,128 +371,146 @@ static void UpdatePlanes(char *balancerUrl, char *zoneName, double latitude, dou
         char *zone = GetUrl(url);
         if (zone != NULL)
         {
-            JSON_Value *rootJson = json_parse_string(zone);
-            free(zone);
-            zone = NULL;
+            int cmp = 1;
+            if (lastZone != NULL)
+                cmp = strcmp(zone, lastZone);
 
-            if (rootJson != NULL)
+            if (cmp != 0)
             {
-                if (rootJson->type == JSONObject)
+                JSON_Value *rootJson = json_parse_string(zone);
+                lastZone = zone;
+
+                if (rootJson != NULL)
                 {
-                    JSON_Object *aircraftJson = json_value_get_object(rootJson);
-                    if (aircraftJson != NULL)
+                    if (rootJson->type == JSONObject)
                     {
-                        size_t aircraftCount = json_object_get_count(aircraftJson);
-                        for (int i = 0; i < aircraftCount; i++)
+                        JSON_Object *aircraftJson = json_value_get_object(rootJson);
+                        if (aircraftJson != NULL)
                         {
-                            const char *id = json_object_get_name(aircraftJson, i);
-                            if (id != NULL)
+                            size_t aircraftCount = json_object_get_count(aircraftJson);
+                            for (int i = 0; i < aircraftCount; i++)
                             {
-                                JSON_Value *value = json_object_get_value(aircraftJson, id);
-
-                                if (value != NULL && value->type == JSONArray)
+                                const char *id = json_object_get_name(aircraftJson, i);
+                                if (id != NULL)
                                 {
-                                    JSON_Array *propertiesJson = json_value_get_array(value);
+                                    JSON_Value *value = json_object_get_value(aircraftJson, id);
 
-                                    if (propertiesJson != NULL)
+                                    if (value != NULL && value->type == JSONArray)
                                     {
-                                        const char *registration = NULL, *icaoId = NULL, *icaoType = NULL, *squawk = NULL;
-                                        double latitudePlane = 0.0, longitudePlane = 0.0, altitude = 0.0;
-                                        float heading = 0.0f;
-                                        int speed = 0, verticalSpeed = 0;
+                                        JSON_Array *propertiesJson = json_value_get_array(value);
 
-                                        int propertyCount = json_array_get_count(propertiesJson);
-                                        for (int k = 0; k < propertyCount; k++)
+                                        if (propertiesJson != NULL)
                                         {
-                                            JSON_Value *valueJson = json_array_get_value(propertiesJson, k);
+                                            const char *registration = NULL, *icaoId = NULL, *icaoType = NULL, *squawk = NULL;
+                                            double latitudePlane = 0.0, longitudePlane = 0.0, altitude = 0.0;
+                                            float heading = 0.0f;
+                                            int speed = 0, verticalSpeed = 0;
 
-                                            if (valueJson != NULL)
+                                            int propertyCount = json_array_get_count(propertiesJson);
+                                            for (int k = 0; k < propertyCount; k++)
                                             {
-                                                switch (k)
+                                                JSON_Value *valueJson = json_array_get_value(propertiesJson, k);
+
+                                                if (valueJson != NULL)
                                                 {
-                                                case ARRAY_INDEX_LATITUDE:
-                                                    latitudePlane = json_value_get_number(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_LONGITUDE:
-                                                    longitudePlane = json_value_get_number(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_ALTITUDE:
-                                                    altitude = json_value_get_number(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_HEADING:
-                                                    heading = (float) json_value_get_number(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_SPEED:
-                                                    speed = (int) json_value_get_number(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_SQUAWK:
-                                                    squawk = json_value_get_string(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_ICAO_TYPE:
-                                                    icaoType = json_value_get_string(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_REGISTRATION:
-                                                    registration = json_value_get_string(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_VERTICAL_SPEED:
-                                                    verticalSpeed = (int) json_value_get_number(valueJson);
-                                                    break;
-                                                case ARRAY_INDEX_ICAO_ID:
-                                                    icaoId = json_value_get_string(valueJson);
-                                                    break;
+                                                    switch (k)
+                                                    {
+                                                    case ARRAY_INDEX_LATITUDE:
+                                                        latitudePlane = json_value_get_number(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_LONGITUDE:
+                                                        longitudePlane = json_value_get_number(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_ALTITUDE:
+                                                        altitude = json_value_get_number(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_HEADING:
+                                                        heading = (float) json_value_get_number(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_SPEED:
+                                                        speed = (int) json_value_get_number(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_SQUAWK:
+                                                        squawk = json_value_get_string(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_ICAO_TYPE:
+                                                        icaoType = json_value_get_string(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_REGISTRATION:
+                                                        registration = json_value_get_string(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_VERTICAL_SPEED:
+                                                        verticalSpeed = (int) json_value_get_number(valueJson);
+                                                        break;
+                                                    case ARRAY_INDEX_ICAO_ID:
+                                                        icaoId = json_value_get_string(valueJson);
+                                                        break;
+                                                    }
                                                 }
                                             }
-                                        }
 
-                                        if (latitudePlane != 0.0 && longitudePlane != 0.0 && GetDistance(latitude, longitude, latitudePlane, longitudePlane) <= MAX_DISTANCE)
-                                        {
-                                            Plane *plane = NULL;
-
-                                            pthread_mutex_lock(&planesMutex);
-                                            std::map<std::string, Plane*>::iterator p = planes.find(id);
-                                            if (p != planes.end())
-                                                plane = p->second;
-                                            else
+                                            if (latitudePlane != 0.0 && longitudePlane != 0.0 && GetDistance(latitude, longitude, latitudePlane, longitudePlane) <= MAX_DISTANCE)
                                             {
-                                                plane = (Plane*) malloc(sizeof(*plane));
+                                                Plane *plane = NULL;
+
+                                                pthread_mutex_lock(&planesMutex);
+                                                std::map<std::string, Plane*>::iterator p = planes.find(id);
+                                                if (p != planes.end())
+                                                    plane = p->second;
+                                                else
+                                                {
+                                                    plane = (Plane*) malloc(sizeof(*plane));
+                                                    if (plane != NULL)
+                                                        planes[std::string(id)] = plane;
+                                                }
+
                                                 if (plane != NULL)
-                                                    planes[std::string(id)] = plane;
+                                                {
+                                                    if (registration == NULL || strlen(registration) == 0)
+                                                        registration = "Unknown";
+                                                    if (icaoId == NULL || strlen(icaoId) == 0)
+                                                        icaoId = "Unknown";
+                                                    if (icaoType == NULL || strlen(icaoType) == 0)
+                                                        icaoType = "UKN";
+                                                    if (squawk == NULL || strlen(squawk) == 0)
+                                                        squawk = "0000";
+                                                    strncpy(plane->registration, registration, sizeof(plane->registration) / sizeof(char));
+                                                    strncpy(plane->icaoId, icaoId, sizeof(plane->icaoId) / sizeof(char));
+                                                    strncpy(plane->icaoType, icaoType, sizeof(plane->icaoType) / sizeof(char));
+                                                    strncpy(plane->squawk, squawk, sizeof(plane->squawk) / sizeof(char));
+                                                    if (plane->latitude != latitudePlane)
+                                                    {
+                                                        plane->latitude = latitudePlane;
+                                                        plane->interpolatedLatitude = 0.0;
+                                                    }
+                                                    if (plane->longitude != longitudePlane)
+                                                    {
+                                                        plane->longitude = longitudePlane;
+                                                        plane->interpolatedLongitude = 0.0;
+                                                    }
+                                                    if (plane->altitude != altitude)
+                                                    {
+                                                        plane->altitude = altitude;
+                                                        plane->interpolatedAltitude = -1000.0;
+                                                    }
+                                                    plane->pitch = 0.0f;
+                                                    plane->roll = 0.0f;
+                                                    plane->heading = heading;
+                                                    plane->speed = speed;
+                                                    plane->verticalSpeed = verticalSpeed;
+                                                    plane->lastSeen = currentTime;
+                                                }
+                                                pthread_mutex_unlock(&planesMutex);
                                             }
-
-                                            if (plane != NULL)
-                                            {
-                                                if (registration == NULL || strlen(registration) == 0)
-                                                    registration = "Unknown";
-                                                if (icaoId == NULL || strlen(icaoId) == 0)
-                                                    icaoId = "Unknown";
-                                                if (icaoType == NULL || strlen(icaoType) == 0)
-                                                    icaoType = "UKN";
-                                                if (squawk == NULL || strlen(squawk) == 0)
-                                                    squawk = "0000";
-                                                strncpy(plane->registration, registration, sizeof(plane->registration) / sizeof(char));
-                                                strncpy(plane->icaoId, icaoId, sizeof(plane->icaoId) / sizeof(char));
-                                                strncpy(plane->icaoType, icaoType, sizeof(plane->icaoType) / sizeof(char));
-                                                strncpy(plane->squawk, squawk, sizeof(plane->squawk) / sizeof(char));
-                                                plane->latitude = latitudePlane;
-                                                plane->longitude = longitudePlane;
-                                                plane->altitude = altitude;
-                                                plane->pitch = 0.0f;
-                                                plane->roll = 0.0f;
-                                                plane->heading = heading;
-                                                plane->speed = speed;
-                                                plane->verticalSpeed = verticalSpeed;
-                                                plane->lastSeen = currentTime;
-                                            }
-                                            pthread_mutex_unlock(&planesMutex);
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    json_value_free(rootJson);
-                    rootJson = NULL;
+                        json_value_free(rootJson);
+                        rootJson = NULL;
+                    }
                 }
             }
         }
@@ -506,9 +524,9 @@ static void *UpdateThreadFunction(void *ptr)
 
     while (true)
     {
-    pthread_mutex_lock(&positionMutex);
-    double latitude = userLatitude, longitude = userLongitude;
-    pthread_mutex_unlock(&positionMutex);
+        pthread_mutex_lock(&positionMutex);
+        double latitude = userLatitude, longitude = userLongitude;
+        pthread_mutex_unlock(&positionMutex);
 
         char *balancerUrl = GetBalancerUrl();
 //        printf("URL -> %s\n", balancerUrl);
@@ -548,12 +566,24 @@ void Init(void)
     pthread_create(&thread, NULL, UpdateThreadFunction, NULL);
 }
 
-// destroys the mutexes
+// uninitializes the reserved memory, thread and mutexes
 void Cleanup(void)
 {
+    pthread_mutex_lock(&planesMutex);
+    for (std::map<std::string, Plane*>::iterator p = planes.begin(); p != planes.end(); ++p)
+    {
+        Plane *plane = p->second;
+        free(plane);
+        plane = NULL;
+        planes.erase(p->first);
+    }
+    pthread_mutex_unlock(&planesMutex);
     pthread_cancel(thread);
     pthread_mutex_destroy(&planesMutex);
     pthread_mutex_destroy(&positionMutex);
+
+    if (lastZone != NULL)
+        free(lastZone);
 }
 
 /*int main(void)
